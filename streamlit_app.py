@@ -1,296 +1,122 @@
 #!/usr/bin/env python3
-import re
-import time
-import math
-import requests
-import tldextract
-import pandas as pd
-from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urldefrag, urlparse
-from collections import deque, defaultdict
-
 import streamlit as st
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+import pandas as pd
 
-# ------------------------- CONFIG -------------------------
-TIMEOUT = 10
-HEADERS = {"User-Agent": "Mozilla/5.0 (RankingBot/1.0)"}
+# ---------------------------
+# Helper Functions
+# ---------------------------
 
-# ------------------------- HELPERS -------------------------
-def normalize_url(base, link):
-    if not link:
-        return None
-    # remove anchors/fragments; build absolute
-    url = urljoin(base, link)
-    url, _ = urldefrag(url)
-    # keep only http(s)
-    if not (url.startswith("http://") or url.startswith("https://")):
-        return None
-    return url
-
-def same_site(seed, candidate):
-    s1 = tldextract.extract(seed)
-    s2 = tldextract.extract(candidate)
-    return (s1.registered_domain == s2.registered_domain)
-
-def get_html(url):
+def fetch_page(url):
+    """Fetch the HTML content of a single webpage."""
     try:
-        r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
-        ctype = r.headers.get("Content-Type","").lower()
-        if r.status_code == 200 and "text/html" in ctype:
-            return r.text, r.headers
-    except requests.RequestException:
-        return None, {}
-    return None, {}
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        return response.text
+    except Exception as e:
+        st.error(f"Error fetching {url}: {e}")
+        return ""
 
-def parse_page(url, html):
-    soup = BeautifulSoup(html, "html.parser")
-    title = (soup.title.string.strip() if soup.title and soup.title.string else "")
-    # text content
-    for bad in soup(["script","style","noscript"]):
-        bad.extract()
-    text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
-    # headers
-    headers = " ".join(h.get_text(" ", strip=True) for h in soup.find_all(re.compile("^h[1-3]$")))
-    # links
-    links = [a.get("href") for a in soup.find_all("a", href=True)]
-    return title, text, headers, links
+def extract_links(base_url, html_content):
+    """Extract and normalize all internal links from a page."""
+    soup = BeautifulSoup(html_content, "html.parser")
+    links = set()
+    for a_tag in soup.find_all("a", href=True):
+        href = a_tag["href"]
+        full_url = urljoin(base_url, href)
+        if base_url in full_url:  # keep only internal links
+            links.add(full_url.split("#")[0])  # strip fragments
+    return links
 
-def pagerank(graph, damping=0.85, max_iter=40, tol=1.0e-6):
-    nodes = list(graph.keys())
-    N = len(nodes)
-    if N == 0:
-        return {}
-    idx = {n:i for i,n in enumerate(nodes)}
-    outdeg = {n: len([t for t in graph[n] if t in idx]) for n in nodes}
-    rank = {n: 1.0/N for n in nodes}
-
-    for _ in range(max_iter):
-        new = dict.fromkeys(nodes, (1.0 - damping)/N)
-        for n in nodes:
-            if outdeg[n] == 0:
-                # distribute dangling
-                share = damping * (rank[n]/N)
-                for m in nodes:
-                    new[m] += share
-            else:
-                share = damping * (rank[n]/outdeg[n])
-                for t in graph[n]:
-                    if t in idx:
-                        new[t] += share
-        delta = sum(abs(new[n]-rank[n]) for n in nodes)
-        rank = new
-        if delta < tol:
-            break
-    return rank
-
-def safe_len(x):
-    return len(x) if isinstance(x, (list, set, dict, str)) else 0
-
-def try_last_modified(headers):
-    lm = headers.get("Last-Modified")
-    if not lm:
-        return None
-    return lm  # just bubble raw header; optional scoring fallback below
-
-def normalize_series(s):
-    if s.empty:
-        return s
-    mn, mx = s.min(), s.max()
-    if math.isclose(mx, mn):
-        return pd.Series([0.5]*len(s), index=s.index)
-    return (s - mn) / (mx - mn)
-
-# ------------------------- STREAMLIT UI -------------------------
-st.set_page_config(page_title="Automated Page Ranking", layout="wide")
-st.title("🔎 Automated Identification & Ranking of Website Pages")
-st.caption("Ranks pages by structure, content, and relevance signals")
-
-with st.sidebar:
-    seed_url = st.text_input("Seed URLss (e.g., https://www.egain.com)", "https://www.egain.com")
-    topic = st.text_input("Relevance Topics / Query (comma-separated keywords)", "knowledge, customer service, ai")
-    max_pages = st.number_input("Max pages to crawl", 20, 1000, 150, step=10)
-    per_domain_only = st.checkbox("Restrict to same registered domain", True)
-    crawl_btn = st.button("Crawl & Rank")
-
-# ------------------------- CRAWL -------------------------
-if crawl_btn:
-    t0 = time.time()
-    st.info("Crawling… this may take a minute depending on site & depth.")
-
+def crawl_website(base_url, max_pages=10):
+    """Crawl website and return a dictionary of {url: text_content}."""
     visited = set()
-    q = deque([seed_url])
-    graph = defaultdict(set)        # adjacency list
-    inlinks = defaultdict(set)      # reverse links
-    pages = {}                      # url -> {title,text,headers,links,lastmod}
-    order = []                      # discovered order
+    to_visit = [base_url]
+    pages = {}
 
-    while q and len(visited) < max_pages:
-        url = q.popleft()
+    while to_visit and len(visited) < max_pages:
+        url = to_visit.pop(0)
         if url in visited:
             continue
-        if per_domain_only and not same_site(seed_url, url):
-            continue
 
-        html, headers = get_html(url)
-        visited.add(url)
+        html = fetch_page(url)
         if not html:
             continue
 
-        title, text, headers_text, links = parse_page(url, html)
-        lastmod = try_last_modified(headers)
-        order.append(url)
-        pages[url] = {
-            "title": title,
-            "text": text,
-            "headers": headers_text,
-            "links": [],
-            "lastmod": lastmod
-        }
+        soup = BeautifulSoup(html, "html.parser")
+        text = soup.get_text(" ", strip=True)
+        pages[url] = text
 
-        # normalize and keep internal links first
-        normalized_links = []
-        for lk in links:
-            nu = normalize_url(url, lk)
-            if not nu:
-                continue
-            if per_domain_only and not same_site(seed_url, nu):
-                continue
-            normalized_links.append(nu)
+        new_links = extract_links(base_url, html)
+        to_visit.extend(new_links - visited)
+        visited.add(url)
 
-        # Deduplicate but keep order
-        seen = set()
-        cleaned = []
-        for lk in normalized_links:
-            if lk not in seen:
-                seen.add(lk)
-                cleaned.append(lk)
+    return pages
 
-        pages[url]["links"] = cleaned
-        for lk in cleaned:
-            graph[url].add(lk)
-            inlinks[lk].add(url)
-            if lk not in visited and len(visited) + len(q) < max_pages:
-                q.append(lk)
-
-    # make sure all nodes exist in graph even if no outlinks
-    for u in list(pages.keys()):
-        graph.setdefault(u, set())
-
-    # ------------------------- SIGNALS -------------------------
-    # Structure: PageRank, in-degree, out-degree, crawl-depth (discovery order)
-    pr = pagerank(graph)
-    in_deg = {u: safe_len(inlinks.get(u, set())) for u in pages}
-    out_deg = {u: safe_len(graph.get(u, set())) for u in pages}
-    depth_idx = {u: i for i,u in enumerate(order)}  # earlier discovery ~ shallower
-
-    # Content: TF-IDF relevance vs topic; Title/Header boosts; Content length
-    docs = [pages[u]["text"] for u in pages]
+def rank_pages(pages, query):
+    """Rank pages by cosine similarity to query using TF-IDF."""
+    documents = list(pages.values())
     urls = list(pages.keys())
 
-    # Build TF-IDF on corpus + query terms
-    vectorizer = TfidfVectorizer(stop_words="english", max_features=20000)
-    X = vectorizer.fit_transform(docs + [topic])
-    corpus_X, query_x = X[:-1], X[-1]
-    cos = cosine_similarity(corpus_X, query_x)
-    relevance = {urls[i]: float(cos[i][0]) for i in range(len(urls))}
+    # Fit TF-IDF on documents + query
+    vectorizer = TfidfVectorizer(stop_words="english")
+    doc_vectors = vectorizer.fit_transform(documents)
+    query_vector = vectorizer.transform([query])
 
-    # simple keyword boost for title/headers
-    topic_terms = [t.strip().lower() for t in re.split(r"[,\s]+", topic) if t.strip()]
-    def kw_hits(s):
-        s = (s or "").lower()
-        return sum(s.count(k) for k in topic_terms) if s else 0
+    # Debugging: check shapes
+    st.write(f"Document vectors shape: {doc_vectors.shape}")
+    st.write(f"Query vector shape: {query_vector.shape}")
 
-    title_hits = {u: kw_hits(pages[u]["title"]) for u in pages}
-    header_hits = {u: kw_hits(pages[u]["headers"]) for u in pages}
-    content_len = {u: len((pages[u]["text"] or "")) for u in pages}
+    # Cosine similarity
+    scores = cosine_similarity(doc_vectors, query_vector).flatten()
 
-    # Freshness: use presence of Last-Modified header as a weak signal
-    freshness = {u: 1.0 if pages[u]["lastmod"] else 0.0 for u in pages}
-
-    # ------------------------- SCORING -------------------------
-    df = pd.DataFrame({
+    # Rank
+    results = pd.DataFrame({
         "url": urls,
-        "title": [pages[u]["title"] for u in urls],
-        "in_degree": [in_deg[u] for u in urls],
-        "out_degree": [out_deg[u] for u in urls],
-        "pagerank": [pr.get(u, 0.0) for u in urls],
-        "tfidf_relevance": [relevance[u] for u in urls],
-        "title_hits": [title_hits[u] for u in urls],
-        "header_hits": [header_hits[u] for u in urls],
-        "content_length": [content_len[u] for u in urls],
-        "freshness_hint": [freshness[u] for u in urls],
-        "discovery_order": [depth_idx[u] for u in urls],
-    })
+        "relevance_score": scores
+    }).sort_values(by="relevance_score", ascending=False)
 
-    # Normalize and combine (weights adjustable in UI)
-    with st.sidebar:
-        st.markdown("---")
-        st.subheader("Weights")
-        w_pr = st.slider("Structure: PageRank", 0.0, 1.0, 0.30, 0.05)
-        w_in = st.slider("Structure: In-degree", 0.0, 1.0, 0.20, 0.05)
-        w_out = st.slider("Structure: Out-degree", 0.0, 1.0, 0.05, 0.05)
-        w_rel = st.slider("Content: TF-IDF relevance", 0.0, 1.0, 0.35, 0.05)
-        w_th = st.slider("Content: Title/Headers boost", 0.0, 1.0, 0.05, 0.05)
-        w_len = st.slider("Content: Length", 0.0, 1.0, 0.03, 0.01)
-        w_fr = st.slider("Freshness hint", 0.0, 1.0, 0.02, 0.01)
+    return results
 
-    df["n_pr"] = normalize_series(df["pagerank"])
-    df["n_in"] = normalize_series(df["in_degree"])
-    df["n_out"] = normalize_series(df["out_degree"])
-    df["n_rel"] = normalize_series(df["tfidf_relevance"])
-    df["n_th"] = normalize_series(df["title_hits"] + df["header_hits"])
-    df["n_len"] = normalize_series(df["content_length"])
-    df["n_fr"] = df["freshness_hint"]  # already 0/1
+# ---------------------------
+# Streamlit App
+# ---------------------------
 
-    df["score"] = (
-        w_pr*df["n_pr"] +
-        w_in*df["n_in"] +
-        w_out*df["n_out"] +
-        w_rel*df["n_rel"] +
-        w_th*df["n_th"] +
-        w_len*df["n_len"] +
-        w_fr*df["n_fr"]
-    )
+st.title("🔎 Website Page Relevance Ranker")
 
-    df = df.sort_values("score", ascending=False).reset_index(drop=True)
+# User inputs
+website = st.text_input("Enter website URL:", "www.egain.com")
+query = st.text_input("Relevance Topic / Query (comma-separated keywords):", "AI, customer service")
+max_pages = st.slider("Max pages to crawl:", 5, 30, 10)
 
-    # ------------------------- UI OUTPUT -------------------------
-    st.success(f"Crawled {len(df)} pages in {time.time()-t0:.1f}s")
+if st.button("Analyze"):
+    # Ensure https:// prefix
+    if not website.startswith("http"):
+        website = "https://" + website
 
-    st.subheader("🏆 Top Ranked Pages")
-    st.dataframe(
-        df[["url","title","score","pagerank","in_degree","out_degree","tfidf_relevance","title_hits","header_hits","freshness_hint"]]
-        .head(30),
-        use_container_width=True
-    )
+    st.write(f"Crawling: {website}")
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.markdown("**Structure vs Relevance**")
-        st.scatter_chart(df[["n_pr","n_in","n_rel"]].rename(columns={"n_pr":"PageRank","n_in":"InDeg","n_rel":"Relevance"}))
-    with c2:
-        st.markdown("**Distribution of Scores**")
-        st.bar_chart(df["score"])
-    with c3:
-        st.markdown("**Top Outdegree Pages**")
-        st.bar_chart(df.sort_values("out_degree",ascending=False).head(10)[["out_degree"]])
+    # Crawl website
+    pages = crawl_website(website, max_pages=max_pages)
 
-    st.markdown("### Raw Results (CSV)")
-    st.download_button(
-        "Download Rankings CSV",
-        df.to_csv(index=False).encode("utf-8"),
-        file_name="page_rankings.csv",
-        mime="text/csv"
-    )
+    if not pages:
+        st.error("No pages fetched. Please try again with a different site.")
+    else:
+        st.success(f"Fetched {len(pages)} pages ✅")
 
-    with st.expander("Explainability: How score is computed"):
-        st.write("""
-        **score =** w_pr·PageRank + w_in·In-degree + w_out·Out-degree +
-        w_rel·TF-IDF relevance + w_th·(Title+Header keyword hits) +
-        w_len·Content length + w_fr·Freshness hint
+        # Rank pages
+        results = rank_pages(pages, query)
 
-        All inputs are min–max normalized per crawl (0–1) except freshness (0/1).
-        We show top pages, plus structural & content diagnostics.
-        """)
+        # Show results
+        st.subheader("Ranked Pages")
+        st.dataframe(results)
+
+        # Show top 3
+        st.subheader("Top 3 Pages")
+        for i, row in results.head(3).iterrows():
+            st.markdown(f"**[{row['url']}]({row['url']})** — Relevance: {row['relevance_score']:.4f}")
+
