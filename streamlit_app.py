@@ -109,7 +109,7 @@ st.caption("Ranks pages by structure, content, and relevance signals")
 
 with st.sidebar:
     seed_url = st.text_input("Seed URLss (e.g., https://www.egain.com)", "https://www.egain.com")
-    topic = st.text_input("Relevance Topic / Query (comma-separated keywords)", "knowledge, customer service, ai")
+    topic = st.text_input("Relevance Topics / Query (comma-separated keywords)", "knowledge, customer service, ai")
     max_pages = st.number_input("Max pages to crawl", 20, 1000, 150, step=10)
     per_domain_only = st.checkbox("Restrict to same registered domain", True)
     crawl_btn = st.button("Crawl & Rank")
